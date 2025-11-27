@@ -1,11 +1,12 @@
 import os
-from typing import List, Optional, Dict, Any, Callable
+from typing import List, Optional, Dict, Any, Callable, Iterable
 from threading import Lock
 from uuid import uuid4
 from datetime import datetime
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query, Path, Header, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, EmailStr
 
 # In-memory stores with thread-safety via locks
@@ -75,6 +76,18 @@ _seed_users_once()
 # Shared utilities
 def now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
+def _iso_to_date_str(iso_ts: Optional[str]) -> Optional[str]:
+    """Convert an ISO timestamp with optional trailing Z into YYYY-MM-DD date string."""
+    if not iso_ts:
+        return None
+    ts = iso_ts.rstrip("Z")
+    try:
+        # Try parsing fractional seconds as well
+        dt = datetime.fromisoformat(ts)
+        return dt.date().isoformat()
+    except Exception:
+        return None
 
 
 # PUBLIC_INTERFACE
@@ -247,6 +260,20 @@ class SummaryReport(BaseModel):
     done_tasks: int = Field(..., description="Tasks with status 'done'")
     total_resources: int = Field(..., description="Total number of resources")
     pending_approvals: int = Field(..., description="Total pending approvals")
+
+# PUBLIC_INTERFACE
+class TrendsPoint(BaseModel):
+    """Single time point counts for entities, grouped per day."""
+    date: str = Field(..., description="Calendar date (YYYY-MM-DD)")
+    tasks: int = Field(..., description="Number of tasks created on this date")
+    projects: int = Field(..., description="Number of projects created on this date")
+    resources: int = Field(..., description="Number of resources created on this date")
+    approvals: int = Field(..., description="Number of approvals created on this date")
+
+# PUBLIC_INTERFACE
+class TrendsReport(BaseModel):
+    """Daily trend counts for key entities."""
+    points: List[TrendsPoint] = Field(..., description="List of day-wise counts")
 
 
 # App initialization with metadata and CORS
@@ -635,7 +662,7 @@ def delete_approval(approval_id: str) -> MessageResponse:
 # ========== Reports Routes ==========
 reports_router = APIRouter(prefix="/api/reports", tags=["Reports"])
 
-@reports_router.get("/summary", summary="Summary Report", response_model=SummaryReport)
+@reports_router.get("/summary", summary="Summary Report", response_model=SummaryReport, dependencies=[Depends(role_required(["admin","manager"]))])
 def summary_report() -> SummaryReport:
     """Return aggregate counts of major entities."""
     tasks = tasks_store.list()
@@ -648,6 +675,86 @@ def summary_report() -> SummaryReport:
         total_resources=len(resources_store.list()),
         pending_approvals=len([a for a in approvals_store.list() if a.get("status") == "pending"]),
     )
+
+@reports_router.get(
+    "/trends",
+    summary="Trends Report",
+    response_model=TrendsReport,
+    dependencies=[Depends(role_required(["admin","manager"]))],
+)
+def trends_report(
+    date_from: Optional[str] = Query(None, description="Start date (YYYY-MM-DD) inclusive"),
+    date_to: Optional[str] = Query(None, description="End date (YYYY-MM-DD) inclusive"),
+) -> TrendsReport:
+    """Return simple daily counts based on created_at in-memory fields for projects, tasks, resources, approvals."""
+    # Build per-day counters
+    counters: Dict[str, Dict[str, int]] = {}
+
+    def bump(day: Optional[str], key: str) -> None:
+        if not day:
+            return
+        # Filter by optional window
+        if date_from and day < date_from:
+            return
+        if date_to and day > date_to:
+            return
+        if day not in counters:
+            counters[day] = {"tasks": 0, "projects": 0, "resources": 0, "approvals": 0}
+        counters[day][key] += 1
+
+    for p in projects_store.list():
+        bump(_iso_to_date_str(p.get("created_at")), "projects")
+    for t in tasks_store.list():
+        bump(_iso_to_date_str(t.get("created_at")), "tasks")
+    for r in resources_store.list():
+        bump(_iso_to_date_str(r.get("created_at")), "resources")
+    for a in approvals_store.list():
+        bump(_iso_to_date_str(a.get("created_at")), "approvals")
+
+    points: List[TrendsPoint] = []
+    for day in sorted(counters.keys()):
+        c = counters[day]
+        points.append(TrendsPoint(date=day, tasks=c["tasks"], projects=c["projects"], resources=c["resources"], approvals=c["approvals"]))
+    return TrendsReport(points=points)
+
+@reports_router.get(
+    "/export",
+    summary="Export Tasks CSV",
+    description="CSV download for tasks with key fields: id,project_id,title,assignee_id,status,created_at,updated_at",
+    dependencies=[Depends(role_required(['admin','manager']))],
+    response_class=StreamingResponse,
+)
+def export_tasks_csv(
+    project_id: Optional[str] = Query(None, description="Filter by project id"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+) -> StreamingResponse:
+    """Stream a CSV of tasks from the in-memory store with a simple filter."""
+    # Prepare data
+    items = tasks_store.list()
+    if project_id:
+        items = [t for t in items if t.get("project_id") == project_id]
+    if status:
+        items = [t for t in items if t.get("status") == status]
+
+    headers = ["id", "project_id", "title", "assignee_id", "status", "created_at", "updated_at"]
+
+    def row_iter() -> Iterable[str]:
+        # header
+        yield ",".join(headers) + "\n"
+        for t in items:
+            vals = [
+                str(t.get("id", "")),
+                str(t.get("project_id", "")),
+                '"' + str(t.get("title", "")).replace('"', '""') + '"',
+                str(t.get("assignee_id", "")) if t.get("assignee_id") is not None else "",
+                str(t.get("status", "")),
+                str(t.get("created_at", "")),
+                str(t.get("updated_at", "")),
+            ]
+            yield ",".join(vals) + "\n"
+
+    filename = f"tasks_export_{datetime.utcnow().date().isoformat()}.csv"
+    return StreamingResponse(row_iter(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 # Register routers
