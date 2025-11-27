@@ -1,0 +1,4 @@
+{
+    "command": "pytest",
+    "working_directory": "/home/kavia/workspace/code-generation/enterprise-resource-management-platform-215220-215230/resource_platform_backend"
+}
