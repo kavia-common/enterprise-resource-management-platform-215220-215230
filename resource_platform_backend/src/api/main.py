@@ -1,10 +1,10 @@
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 from threading import Lock
 from uuid import uuid4
 from datetime import datetime
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query, Path
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query, Path, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 
@@ -52,6 +52,26 @@ tasks_store = ThreadSafeStore()
 resources_store = ThreadSafeStore()
 approvals_store = ThreadSafeStore()
 
+# Seed in-memory users with roles for demo
+def _seed_users_once():
+    if users_store.list():
+        return
+    now = datetime.utcnow().isoformat() + "Z"
+    for user in [
+        {"email": "admin@example.com", "name": "Admin User", "password": "admin123", "role": "admin"},
+        {"email": "manager@example.com", "name": "Manager User", "password": "manager123", "role": "manager"},
+        {"email": "user@example.com", "name": "Standard User", "password": "user123", "role": "user"},
+    ]:
+        users_store.create({
+            "id": str(uuid4()),
+            "email": user["email"],
+            "name": user["name"],
+            "password": user["password"],
+            "role": user["role"],
+            "created_at": now
+        })
+_seed_users_once()
+
 # Shared utilities
 def now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
@@ -92,10 +112,15 @@ class AuthUser(BaseModel):
     created_at: str = Field(..., description="ISO timestamp of creation")
 
 # PUBLIC_INTERFACE
+class AuthUserWithRole(AuthUser):
+    """User details with role for session context."""
+    role: str = Field(..., description="User role (admin|manager|user)")
+
+# PUBLIC_INTERFACE
 class AuthResponse(BaseModel):
     """Authentication response with a bearer token and user."""
     token: str = Field(..., description="Session token")
-    user: AuthUser = Field(..., description="Authenticated user profile")
+    user: AuthUserWithRole = Field(..., description="Authenticated user profile with role")
 
 
 # ========== Project Models ==========
@@ -251,9 +276,20 @@ app.add_middleware(
 )
 
 
-# ========== Dependencies ==========
-def get_current_user(token: Optional[str] = Query(None, description="Bearer token from login")) -> Optional[Dict[str, Any]]:
-    """Return current user from a token (query for simplicity), or None if not provided."""
+# ========== Auth/RBAC Dependencies ==========
+# PUBLIC_INTERFACE
+def parse_bearer_token(authorization: Optional[str] = Header(default=None, alias="Authorization")) -> Optional[str]:
+    """Parse bearer token from Authorization header and return token string or None."""
+    if not authorization:
+        return None
+    parts = authorization.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+# PUBLIC_INTERFACE
+def get_current_user(token: Optional[str] = Depends(parse_bearer_token)) -> Optional[Dict[str, Any]]:
+    """Return current user from a bearer token, or None if not provided/invalid."""
     if not token:
         return None
     session = sessions_store.get(token)
@@ -261,6 +297,23 @@ def get_current_user(token: Optional[str] = Query(None, description="Bearer toke
         return None
     user = users_store.get(session.get("user_id"))
     return user
+
+# PUBLIC_INTERFACE
+def require_auth(user: Optional[Dict[str, Any]] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Require an authenticated user; raise 401 if missing."""
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    return user
+
+# PUBLIC_INTERFACE
+def role_required(allowed_roles: List[str]) -> Callable:
+    """Dependency factory to enforce that the current user has one of the allowed roles."""
+    def _dependency(user: Dict[str, Any] = Depends(require_auth)) -> Dict[str, Any]:
+        role = user.get("role")
+        if role not in allowed_roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: insufficient role")
+        return user
+    return _dependency
 
 
 # ========== Health Routes ==========
@@ -288,11 +341,11 @@ def register(req: RegisterRequest) -> AuthUser:
         "email": str(req.email),
         "name": req.name,
         "password": req.password,  # For MVP only; do NOT store plain passwords in real apps
+        "role": "user",
         "created_at": now_iso(),
     }
     users_store.create(user_data)
     return AuthUser(id=user_data["id"], email=user_data["email"], name=user_data["name"], created_at=user_data["created_at"])
-
 
 @auth_router.post("/login", summary="Login", response_model=AuthResponse)
 def login(req: LoginRequest) -> AuthResponse:
@@ -310,12 +363,17 @@ def login(req: LoginRequest) -> AuthResponse:
     sessions_store.create({"id": token, "user_id": found["id"], "created_at": now_iso()})
     return AuthResponse(
         token=token,
-        user=AuthUser(id=found["id"], email=found["email"], name=found["name"], created_at=found["created_at"])
+        user=AuthUserWithRole(id=found["id"], email=found["email"], name=found["name"], created_at=found["created_at"], role=found.get("role","user"))
     )
 
+# PUBLIC_INTERFACE
+@auth_router.get("/me", summary="Get current user", response_model=AuthUserWithRole)
+def me(user: Dict[str, Any] = Depends(require_auth)) -> AuthUserWithRole:
+    """Return the currently authenticated user's profile and role."""
+    return AuthUserWithRole(id=user["id"], email=user["email"], name=user["name"], created_at=user["created_at"], role=user.get("role","user"))
 
 @auth_router.post("/logout", summary="Logout", response_model=MessageResponse)
-def logout(token: Optional[str] = Query(None, description="Bearer token from login")) -> MessageResponse:
+def logout(token: Optional[str] = Depends(parse_bearer_token)) -> MessageResponse:
     """Logout by deleting the session token."""
     if not token:
         raise HTTPException(status_code=400, detail="Token required")
@@ -335,10 +393,10 @@ def list_projects() -> List[Project]:
     """List all projects."""
     return [Project(**p) for p in projects_store.list()]
 
-@projects_router.post("", summary="Create Project", response_model=Project)
-def create_project(req: ProjectCreate, user=Depends(get_current_user)) -> Project:
+@projects_router.post("", summary="Create Project", response_model=Project, dependencies=[Depends(role_required(["admin","manager"]))])
+def create_project(req: ProjectCreate, user: Dict[str, Any] = Depends(require_auth)) -> Project:
     """Create a new project. Owner is current user if available."""
-    owner_id = req.owner_id or (user["id"] if user else None)
+    owner_id = req.owner_id or user["id"]
     now = now_iso()
     data = {
         "id": str(uuid4()),
@@ -359,7 +417,7 @@ def get_project(project_id: str = Path(...)) -> Project:
         raise HTTPException(status_code=404, detail="Project not found")
     return Project(**p)
 
-@projects_router.put("/{project_id}", summary="Update Project", response_model=Project)
+@projects_router.put("/{project_id}", summary="Update Project", response_model=Project, dependencies=[Depends(role_required(["admin","manager"]))])
 def update_project(project_id: str, req: ProjectUpdate) -> Project:
     """Update an existing project."""
     updates: Dict[str, Any] = {k: v for k, v in req.model_dump(exclude_none=True).items()}
@@ -370,7 +428,7 @@ def update_project(project_id: str, req: ProjectUpdate) -> Project:
         raise HTTPException(status_code=404, detail="Project not found")
     return Project(**p)
 
-@projects_router.delete("/{project_id}", summary="Delete Project", response_model=MessageResponse)
+@projects_router.delete("/{project_id}", summary="Delete Project", response_model=MessageResponse, dependencies=[Depends(role_required(["admin"]))])
 def delete_project(project_id: str) -> MessageResponse:
     """Delete a project by id."""
     try:
@@ -404,7 +462,7 @@ def list_tasks(project_id: Optional[str] = Query(None, description="Filter by pr
         items = [t for t in items if t.get("status") == status]
     return [Task(**t) for t in items]
 
-@tasks_router.post("", summary="Create Task", response_model=Task)
+@tasks_router.post("", summary="Create Task", response_model=Task, dependencies=[Depends(role_required(["admin","manager"]))])
 def create_task(req: TaskCreate) -> Task:
     """Create a new task under a project."""
     if not projects_store.get(req.project_id):
@@ -431,7 +489,7 @@ def get_task(task_id: str) -> Task:
         raise HTTPException(status_code=404, detail="Task not found")
     return Task(**t)
 
-@tasks_router.put("/{task_id}", summary="Update Task", response_model=Task)
+@tasks_router.put("/{task_id}", summary="Update Task", response_model=Task, dependencies=[Depends(role_required(["admin","manager"]))])
 def update_task(task_id: str, req: TaskUpdate) -> Task:
     """Update an existing task."""
     updates: Dict[str, Any] = {k: v for k, v in req.model_dump(exclude_none=True).items()}
@@ -442,7 +500,7 @@ def update_task(task_id: str, req: TaskUpdate) -> Task:
         raise HTTPException(status_code=404, detail="Task not found")
     return Task(**t)
 
-@tasks_router.delete("/{task_id}", summary="Delete Task", response_model=MessageResponse)
+@tasks_router.delete("/{task_id}", summary="Delete Task", response_model=MessageResponse, dependencies=[Depends(role_required(["admin"]))])
 def delete_task(task_id: str) -> MessageResponse:
     """Delete a task by id."""
     try:
@@ -463,7 +521,7 @@ def list_resources(resource_type: Optional[str] = Query(None, alias="type", desc
         items = [r for r in items if r.get("type") == resource_type]
     return [Resource(**r) for r in items]
 
-@resources_router.post("", summary="Create Resource", response_model=Resource)
+@resources_router.post("", summary="Create Resource", response_model=Resource, dependencies=[Depends(role_required(["admin","manager"]))])
 def create_resource(req: ResourceCreate) -> Resource:
     """Create a new resource."""
     now = now_iso()
@@ -487,7 +545,7 @@ def get_resource(resource_id: str) -> Resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     return Resource(**r)
 
-@resources_router.put("/{resource_id}", summary="Update Resource", response_model=Resource)
+@resources_router.put("/{resource_id}", summary="Update Resource", response_model=Resource, dependencies=[Depends(role_required(["admin","manager"]))])
 def update_resource(resource_id: str, req: ResourceUpdate) -> Resource:
     """Update a resource."""
     updates: Dict[str, Any] = {k: v for k, v in req.model_dump(exclude_none=True).items()}
@@ -498,7 +556,7 @@ def update_resource(resource_id: str, req: ResourceUpdate) -> Resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     return Resource(**r)
 
-@resources_router.delete("/{resource_id}", summary="Delete Resource", response_model=MessageResponse)
+@resources_router.delete("/{resource_id}", summary="Delete Resource", response_model=MessageResponse, dependencies=[Depends(role_required(["admin"]))])
 def delete_resource(resource_id: str) -> MessageResponse:
     """Delete a resource."""
     try:
@@ -519,7 +577,7 @@ def list_approvals(status: Optional[str] = Query(None, description="Filter by st
         items = [a for a in items if a.get("status") == status]
     return [Approval(**a) for a in items]
 
-@approvals_router.post("", summary="Create Approval", response_model=Approval)
+@approvals_router.post("", summary="Create Approval", response_model=Approval, dependencies=[Depends(role_required(["admin","manager"]))])
 def create_approval(req: ApprovalCreate) -> Approval:
     """Create a new approval request."""
     # Optionally verify subject exists
@@ -551,7 +609,7 @@ def get_approval(approval_id: str) -> Approval:
         raise HTTPException(status_code=404, detail="Approval not found")
     return Approval(**a)
 
-@approvals_router.put("/{approval_id}", summary="Update Approval", response_model=Approval)
+@approvals_router.put("/{approval_id}", summary="Update Approval", response_model=Approval, dependencies=[Depends(role_required(["admin","manager"]))])
 def update_approval(approval_id: str, req: ApprovalUpdate) -> Approval:
     """Update an approval (status/approver)."""
     updates: Dict[str, Any] = {k: v for k, v in req.model_dump(exclude_none=True).items()}
@@ -564,7 +622,7 @@ def update_approval(approval_id: str, req: ApprovalUpdate) -> Approval:
         raise HTTPException(status_code=404, detail="Approval not found")
     return Approval(**a)
 
-@approvals_router.delete("/{approval_id}", summary="Delete Approval", response_model=MessageResponse)
+@approvals_router.delete("/{approval_id}", summary="Delete Approval", response_model=MessageResponse, dependencies=[Depends(role_required(["admin"]))])
 def delete_approval(approval_id: str) -> MessageResponse:
     """Delete an approval."""
     try:
