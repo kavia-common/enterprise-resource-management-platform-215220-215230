@@ -374,6 +374,48 @@ def register(req: RegisterRequest) -> AuthUser:
     users_store.create(user_data)
     return AuthUser(id=user_data["id"], email=user_data["email"], name=user_data["name"], created_at=user_data["created_at"])
 
+
+# PUBLIC_INTERFACE
+@auth_router.post("/signup", summary="Sign up", response_model=AuthResponse, description="Create a user in-memory, then log them in by issuing a token. Default role is 'employee' for demo.")
+def signup(req: RegisterRequest) -> AuthResponse:
+    """Register a new user in the in-memory store and return an auth token with default 'employee' role.
+
+    - Ensures email uniqueness (case-insensitive)
+    - Stores password as provided (demo only; not for production)
+    - Issues a bearer token session immediately after registration
+    """
+    # Uniqueness check
+    for u in users_store.list():
+        if u["email"].lower() == req.email.lower():
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+    created_at = now_iso()
+    user_id = str(uuid4())
+    user_data = {
+        "id": user_id,
+        "email": str(req.email),
+        "name": req.name,
+        "password": req.password,  # DEMO ONLY
+        "role": "employee",        # default role per requirement
+        "created_at": created_at,
+    }
+    users_store.create(user_data)
+
+    # Create a session token
+    token = str(uuid4())
+    sessions_store.create({"id": token, "user_id": user_id, "created_at": now_iso()})
+
+    return AuthResponse(
+        token=token,
+        user=AuthUserWithRole(
+            id=user_id,
+            email=user_data["email"],
+            name=user_data["name"],
+            created_at=created_at,
+            role=user_data["role"],
+        ),
+    )
+
 @auth_router.post("/login", summary="Login", response_model=AuthResponse)
 def login(req: LoginRequest) -> AuthResponse:
     """Login and return a session token."""
